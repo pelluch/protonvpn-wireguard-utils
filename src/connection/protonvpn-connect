@@ -1,0 +1,180 @@
+#!/bin/bash
+
+# Function to handle errors and exit
+handle_error() {
+  echo "Error: $1" >&2
+  exit "$2"
+}
+
+# Function to list and select a server configuration
+select_server() {
+  local API_URL="https://vpn-api.proton.me/vpn/logicals"
+  local response config_names logical_servers selected_name choice
+
+  echo "Getting list of servers from ProtonVPN" >&2
+
+  # Fetch JSON response from the API
+  response=$(curl -s "$API_URL")
+  if [[ $? -ne 0 || -z "$response" ]]; then
+    echo "Warning: Failed to call the API. Falling back to local configuration files." >&2
+    fallback_to_local_configs
+    return
+  fi
+
+  echo "Obtaining existing conf files" >&2
+
+  # Get config file names without extensions
+  config_names=$(sudo ls /etc/wireguard/protonvpn | grep '\.conf$' | sed 's/\.conf$//') || handle_error "Failed to list config files." 1
+
+  echo "Obtaining matching list of servers" >&2
+
+  # Parse JSON response and filter by existing configurations
+  logical_servers=$(echo "$response" | jq -r \
+    --argjson configs "$(echo "$config_names" | jq -R -s -c 'split("\n") | map(select(. != ""))')" \
+    '.LogicalServers | map(select(.Name as $name | $configs | index($name))) | sort_by(.Load | tonumber) | .[] | "\(.Name), Load: \(.Load)"')
+
+  # Check if jq parsing succeeded
+  if [[ $? -ne 0 || -z "$logical_servers" ]]; then
+    echo "Warning: Failed to parse the JSON response. Falling back to local configuration files." >&2
+    fallback_to_local_configs
+    return
+  fi
+
+  # Automatically select the first server if the "-a" flag is passed
+  if [[ "$auto_select" == true ]]; then
+    selected_name=$(echo "$logical_servers" | head -n 1 | cut -d, -f1)
+    echo "Automatically selected LogicalServer: $selected_name" >&2
+    echo "$selected_name"
+    return
+  fi
+
+  # Print LogicalServers with indices
+  echo "$logical_servers" | nl -w1 -s") " >&2
+
+  # Prompt user for selection
+  printf "\nChoose a LogicalServer by entering its number (or press Enter to select the first one): " >&2
+  read -r choice
+
+  # Validate user input
+  if [[ -z "$choice" ]]; then
+    selected_name=$(echo "$logical_servers" | head -n 1 | cut -d, -f1)
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le $(echo "$logical_servers" | wc -l) ]]; then
+    selected_name=$(echo "$logical_servers" | sed -n "${choice}p" | cut -d, -f1)
+  else
+    handle_error "Invalid choice." 1
+  fi
+
+  echo "Selected LogicalServer: $selected_name" >&2
+  echo "$selected_name"
+}
+
+fallback_to_local_configs() {
+  echo "Falling back to local configuration files." >&2
+
+  # List available .conf files and sort them by X and Y numerically
+  local config_files
+  config_files=$(sudo ls /etc/wireguard/protonvpn | grep '\.conf$' | sed 's/\.conf$//' | sort -t'#' -k1,1n -k2,2n)
+
+  # Check if there are any config files
+  if [[ -z "$config_files" ]]; then
+    handle_error "No configuration files found in /etc/wireguard/protonvpn." 2
+  fi
+
+  # Automatically select the first configuration if the "-a" flag is passed
+  if [[ "$auto_select" == true ]]; then
+    selected_name=$(echo "$config_files" | head -n 1)
+    echo "Automatically selected configuration: $selected_name" >&2
+    echo "$selected_name"
+    return
+  fi
+
+  # Display the config files with indices
+  echo "Available configurations:" >&2
+  echo "$config_files" | nl -w1 -s") " >&2
+
+  # Prompt the user to choose a configuration
+  printf "\nChoose a configuration by entering its number (or press Enter to select the first one): " >&2
+  read -r choice
+
+  # Validate user input
+  if [[ -z "$choice" ]]; then
+    selected_name=$(echo "$config_files" | head -n 1)
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le $(echo "$config_files" | wc -l) ]]; then
+    selected_name=$(echo "$config_files" | sed -n "${choice}p")
+  else
+    handle_error "Invalid choice." 2
+  fi
+
+  echo "Selected configuration: $selected_name" >&2
+  echo "$selected_name"
+}
+
+
+
+# Main script
+auto_select=false
+if [[ "$1" == "-a" ]]; then
+  echo "Autoconnecting"
+  auto_select=true
+  shift
+fi
+
+if [[ "$#" -eq 1 ]]; then
+  server_name="$1"
+else
+  server_name=$(select_server)
+fi
+
+source_file="/etc/wireguard/protonvpn/${server_name}.conf"
+link_file="/etc/wireguard/wg0.conf"
+
+# Check for configuration file
+echo "Checking if conf file exists for selected server"
+sudo test -f "$source_file" || handle_error "Configuration file '$source_file' does not exist or is inaccessible." 2
+
+# Extract Endpoint line and validate IP and port
+endpoint=$(sudo grep -E '^Endpoint = ' "$source_file") || handle_error "No 'Endpoint' line found in the configuration file." 3
+ip_and_port=$(echo "$endpoint" | sed -E 's/^Endpoint = ([^:]+:[0-9]+)$/\1/') || handle_error "Unable to parse IP and port." 4
+ip=$(echo "$ip_and_port" | cut -d: -f1)
+port=$(echo "$ip_and_port" | cut -d: -f2)
+
+echo "Server IP and port: $ip:$port"
+
+echo "Updating UFW rules"
+
+sudo ufw enable
+
+existing_rules=$(sudo ufw status numbered | grep 'ProtonVPN')
+
+if [[ -n "$existing_rules" ]]; then
+  rule_numbers=()
+
+  # Collect rule numbers in reverse order using a for loop
+  IFS=$'\n' # Ensure that each line is handled correctly
+  for rule in $existing_rules; do
+    rule_number=$(echo "$rule" | awk -F'[][]' '{print $2}')
+    if [[ -n "$rule_number" ]]; then
+      rule_numbers=("$rule_number" "${rule_numbers[@]}")
+    fi
+  done
+
+  # Delete rules starting from the highest rule number to avoid shifting
+  for rule_number in "${rule_numbers[@]}"; do
+    sudo ufw --force delete "$rule_number"
+    echo "Removed existing UFW rule with 'ProtonVPN' comment: Rule $rule_number"
+  done
+else
+  echo "No UFW rules with 'ProtonVPN' comment found."
+fi
+
+
+
+sudo ufw allow out to "$ip" port "$port" proto udp comment 'ProtonVPN' && echo "Added new UFW rule: Allow outgoing to $ip:$port (UDP) with 'ProtonVPN' comment."
+
+sudo systemctl stop wg-quick@wg0.service
+
+# Create or overwrite symbolic link
+sudo ln -sf "$source_file" "$link_file" && echo "Symbolic link created: $link_file -> $source_file"
+
+# Start services
+sudo systemctl start wg-quick@wg0.service 

@@ -1,0 +1,174 @@
+#!/bin/bash
+
+# Constants
+TTL=60 # ProtonVPN-specific requirement
+
+# Load configuration
+CONFIG_FILE="/etc/protonvpn-port-forward.conf"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "Error: Configuration file $CONFIG_FILE not found."
+    exit 1
+fi
+source "$CONFIG_FILE"
+
+# Validate required parameters
+if [[ -z "$GATEWAY" ]]; then
+    echo "Error: GATEWAY is not set in the configuration file."
+    exit 1
+fi
+
+if [[ -z "$REQUEST_SYMMETRICAL_PORT" ]]; then
+    echo "Error: REQUEST_SYMMETRICAL_PORT is not set in the configuration file."
+    exit 1
+fi
+
+if [[ -z "$PORTS_TO_FORWARD" && "$REQUEST_SYMMETRICAL_PORT" != "true" ]]; then
+    echo "Error: PORTS_TO_FORWARD is empty and REQUEST_SYMMETRICAL_PORT is false. Nothing to do."
+    exit 1
+fi
+
+if [[ "$REQUEST_SYMMETRICAL_PORT" == "true" && "$SET_QBITTORRENT_PORT" == "true" ]]; then
+    if [[ -z "$QB_URL" || -z "$QB_USER" || -z "$QB_PASSWORD" ]]; then
+        echo "Error: QB_URL, QB_USER, and QB_PASSWORD must be set in the configuration file if SET_QBITTORRENT_PORT is true."
+        exit 1
+    fi
+fi
+
+# Validate number of ports
+if [[ "${#PORTS_TO_FORWARD[@]}" -gt 5 ]]; then
+    echo "Error: More than 5 ports specified in PORTS_TO_FORWARD. Maximum allowed is 5."
+    exit 1
+fi
+
+# Functions
+login_to_qbittorrent() {
+    curl -si -X POST -d "username=$QB_USER&password=$QB_PASSWORD" "$QB_URL/api/v2/auth/login" | grep -Fi "set-cookie" | awk '{print $2}' | tr -d ';'
+}
+
+get_current_qbittorrent_port() {
+    local COOKIE=$1
+    curl -s --cookie "$COOKIE" "$QB_URL/api/v2/app/preferences" | jq -r '.listen_port'
+}
+
+update_qbittorrent_port() {
+    local PORT=$1
+    local COOKIE=$2
+    curl -s -X POST --cookie "$COOKIE" --data-urlencode "json={\"listen_port\":$PORT}" "$QB_URL/api/v2/app/setPreferences"
+}
+
+nat_pmp_action() {
+    local action=$1
+    local private_port=$2
+    local protocol=$3
+    local ttl=$4
+    output=$(natpmpc -a "$action" "$private_port" "$protocol" "$ttl" -g "$GATEWAY" 2>&1)
+
+    if grep -q "readnatpmpresponseorretry() failed" <<< "$output"; then
+        echo "Error: NAT-PMP request failed."
+        echo "$output" >&2
+        return 1
+    fi
+
+    public_port=$(grep -oP 'Mapped public port \K[0-9]+' <<< "$output")
+    if [[ -n "$public_port" ]]; then
+        echo "$public_port"
+        return 0
+    else
+        echo "Error: Failed to parse the mapped public port."
+        return 1
+    fi
+}
+
+request_nat_pmp_port() {
+    local private_port=$1
+    local protocol=$2
+    local ttl=$3
+    nat_pmp_action 1 "$private_port" "$protocol" "$ttl"
+}
+
+clear_nat_pmp_ports() {
+    local protocol=$1
+    nat_pmp_action 0 0 "$protocol" 0
+}
+
+# Function to display usage
+usage() {
+    echo "Usage: $0 {start|stop}"
+    exit 1
+}
+
+# Check for required parameter
+if [ "$#" -ne 1 ]; then
+    usage
+fi
+
+# Handle "start" and "stop" parameters
+case "$1" in
+    start)
+        # Original behavior of the script goes here
+        echo "Starting script..."
+        ;;
+    stop)
+        echo "Stopping script..."
+        clear_nat_pmp_ports
+        exit 0
+        ;;
+    *)
+        usage
+        ;;
+esac
+
+
+# Check if there is nothing to do
+if [[ "$REQUEST_SYMMETRICAL_PORT" != "true" && "${#PORTS_TO_FORWARD[@]}" -eq 0 ]]; then
+    echo "Error: Nothing to do. Exiting."
+    exit 1
+fi
+
+
+# Clear NAT-PMP ports
+clear_nat_pmp_ports tcp > /dev/null
+clear_nat_pmp_ports udp > /dev/null
+
+# Main Loop
+while true; do
+    if [[ "$REQUEST_SYMMETRICAL_PORT" == "true" ]]; then
+        echo "$(date): Requesting symmetrical port..."
+        SYMM_TCP_PORT=$(request_nat_pmp_port 0 tcp "$TTL")
+        SYMM_UDP_PORT=$(request_nat_pmp_port 0 udp "$TTL")
+
+        if [[ -n "$SYMM_TCP_PORT" && -n "$SYMM_UDP_PORT" ]]; then
+            echo "$(date): Symmetrical ports forwarded: TCP=$SYMM_TCP_PORT, UDP=$SYMM_UDP_PORT"
+            if [[ "$SET_QBITTORRENT_PORT" == "true" ]]; then
+                echo "Trying to log in to bittorrent"
+                COOKIE=$(login_to_qbittorrent)
+                if [ -n "$COOKIE" ]; then
+                    CURRENT_PORT=$(get_current_qbittorrent_port "$COOKIE")
+                    if [ "$CURRENT_PORT" != "$SYMM_TCP_PORT" ]; then
+                        update_qbittorrent_port "$SYMM_TCP_PORT" "$COOKIE"
+                        echo "$(date): Updated qBittorrent listening port to $SYMM_TCP_PORT"
+                    else
+                        echo "$(date): qBittorrent port already set to $SYMM_TCP_PORT"
+                    fi
+                else
+                    echo "$(date): Failed to log in to qBittorrent"
+                fi
+            fi
+        else
+            echo "$(date): Error requesting symmetrical port."
+        fi
+    fi
+
+    for port_config in "${PORTS_TO_FORWARD[@]}"; do
+        IFS=':' read -r private_port protocol <<< "$port_config"
+        echo "$(date): Requesting forwarding for private port $private_port, protocol $protocol..."
+        PUBLIC_PORT=$(request_nat_pmp_port "$private_port" "$protocol" "$TTL")
+        if [[ -n "$PUBLIC_PORT" ]]; then
+            echo "$(date): Public port $PUBLIC_PORT successfully forwarded to internal port $private_port for protocol $protocol"
+        else
+            echo "$(date): Error forwarding port $private_port for protocol $protocol"
+        fi
+    done
+
+    sleep 45
+done

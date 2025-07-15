@@ -1,0 +1,16 @@
+[Unit]
+Description=ProtonVPN Port Forwarding Service
+After=wg-quick@wg0.service protonvpn-connect-best.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/protonvpn-port-forward start
+ExecStopPost=/usr/bin/protonvpn-port-forward stop
+Restart=always
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=protonvpn-port-forward
+RestartPreventExitStatus=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=ProtonVPN Autoselect best conf Service
+Requires=network-online.target
+After=network-online.target wg-quick@wg0.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/protonvpn-connect -a
+# Restart=on-failure
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=protonvpn-autoconnect
+
+[Install]
+WantedBy=multi-user.target

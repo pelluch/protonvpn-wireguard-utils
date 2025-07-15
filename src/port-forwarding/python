@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""
+protonwireguard_natpmp.py
+A Python daemon/service to manage NAT-PMP port forwarding on ProtonVPN connections.
+"""
+
+import sys
+import time
+import subprocess
+import shlex
+import json
+import os
+import signal
+import logging
+from typing import Dict, Optional, List
+
+# -----------------------------------------------------------------------------
+# 1. Configuration and Logging
+# -----------------------------------------------------------------------------
+
+CONFIG_PATH = "/etc/protonwireguard-natpmp.conf"
+TTL = 60  # ProtonVPN's recommended TTL
+SLEEP_INTERVAL = 45
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+def load_config(config_file: str) -> dict:
+    """
+    Load config from JSON or a simple .ini-like file.
+    For example JSON structure:
+    
+    {
+      "gateway": "10.2.0.1",
+      "request_symmetrical_port": true,
+      "ports_to_forward": [
+          {"private_port": 1234, "protocol": "tcp"},
+          {"private_port": 5678, "protocol": "udp"}
+      ],
+      "enable_qbittorrent": true,
+      "qbittorrent": {
+          "url": "http://127.0.0.1:8080",
+          "username": "admin",
+          "password": "secret"
+      },
+      "hook_script": "/usr/local/bin/natpmp_hook.sh"
+    }
+    """
+    if not os.path.isfile(config_file):
+        logging.error("Config file %s not found.", config_file)
+        sys.exit(1)
+
+    with open(config_file, "r", encoding="utf-8") as f:
+        try:
+            conf = json.load(f)
+            return conf
+        except Exception as e:
+            logging.error("Failed to parse config file: %s", e)
+            sys.exit(1)
+
+
+# -----------------------------------------------------------------------------
+# 2. NAT-PMP Logic
+# -----------------------------------------------------------------------------
+
+def call_natpmpc(action: int, private_port: int, protocol: str, ttl: int, gateway: str) -> Optional[int]:
+    """
+    Wrapper for 'natpmpc -a <action> <private_port> <protocol> <ttl> -g <gateway>'.
+    action=1 => request a port
+    action=0 => unmap a port
+    Returns: public port (int) or None on error.
+    """
+    # Example: natpmpc -a 1 0 udp 60 -g 10.2.0.1
+    cmd = f"natpmpc -a {action} {private_port} {protocol} {ttl} -g {gateway}"
+    logging.debug("Running command: %s", cmd)
+    
+    try:
+        output = subprocess.check_output(shlex.split(cmd), stderr=subprocess.STDOUT).decode()
+    except subprocess.CalledProcessError as e:
+        logging.error("Error from natpmpc: %s", e.output.decode())
+        return None
+
+    # Look for lines like: "Mapped public port 53186 protocol UDP to local port 0"
+    # We'll attempt a simple search for "Mapped public port <digits>"
+    # If unmap, public port might be missing or zero—handle that carefully.
+    
+    if "readnatpmpresponseorretry() failed" in output.lower():
+        logging.error("NAT-PMP request failed:\n%s", output)
+        return None
+
+    # Attempt to parse "Mapped public port 53186"
+    import re
+    match = re.search(r"Mapped public port\s+(\d+)", output)
+    if match:
+        return int(match.group(1))
+    
+    # If we didn't match, it might be an unmap call or an error
+    logging.debug("No 'Mapped public port' found in output. Possibly unmap or error.\nOutput: %s", output)
+    return None
+
+
+def clear_all_natpmp(protocol: str, gateway: str) -> None:
+    """
+    Clears all NAT-PMP mappings for a given protocol.
+    natpmpc -a 0 0 <protocol> 0 -g <gateway>
+    """
+    _ = call_natpmpc(0, 0, protocol, 0, gateway)
+
+
+# -----------------------------------------------------------------------------
+# 3. qBittorrent Integration
+# -----------------------------------------------------------------------------
+
+def qbittorrent_login(qb_url: str, username: str, password: str) -> Optional[str]:
+    """
+    Returns a cookie string if successful, otherwise None.
+    """
+    import requests
+
+    try:
+        resp = requests.post(f"{qb_url}/api/v2/auth/login", data={
+            "username": username,
+            "password": password
+        }, timeout=5)
+        if resp.status_code == 200 and "set-cookie" in resp.headers.get("Set-Cookie", "").lower():
+            return resp.headers["Set-Cookie"]
+    except Exception as e:
+        logging.error("Failed to contact qBittorrent: %s", e)
+    return None
+
+
+def qbittorrent_get_port(qb_url: str, cookie: str) -> Optional[int]:
+    import requests
+    try:
+        resp = requests.get(f"{qb_url}/api/v2/app/preferences", headers={"Cookie": cookie}, timeout=5)
+        if resp.status_code == 200:
+            prefs = resp.json()
+            return prefs.get("listen_port", None)
+    except Exception as e:
+        logging.error("Failed to get current port from qBittorrent: %s", e)
+    return None
+
+
+def qbittorrent_set_port(qb_url: str, cookie: str, new_port: int) -> bool:
+    import requests
+    try:
+        # qBittorrent expects JSON data in the "json" field
+        data = {
+            "json": json.dumps({"listen_port": new_port})
+        }
+        resp = requests.post(f"{qb_url}/api/v2/app/setPreferences", headers={"Cookie": cookie}, data=data, timeout=5)
+        if resp.status_code == 200:
+            logging.info("Updated qBittorrent listening port to %s", new_port)
+            return True
+    except Exception as e:
+        logging.error("Failed to update port on qBittorrent: %s", e)
+    return False
+
+
+# -----------------------------------------------------------------------------
+# 4. Hook Invocation
+# -----------------------------------------------------------------------------
+
+def run_hook_script(hook_script: str, arguments: List[str]) -> None:
+    """
+    If a user script is specified, call it with relevant arguments:
+      e.g. ["--symm-tcp=53186", "--symm-udp=53186", "--port-map=1234->9999/tcp"]
+    """
+    if not hook_script:
+        return
+    
+    # Must be executable
+    if not os.access(hook_script, os.X_OK):
+        logging.warning("Hook script %s is not executable or missing. Skipping...", hook_script)
+        return
+    
+    cmd = [hook_script] + arguments
+    logging.info("Running hook script: %s", " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=False)
+    except Exception as e:
+        logging.error("Hook script failed: %s", e)
+
+
+# -----------------------------------------------------------------------------
+# 5. Main Loop (start/stop logic)
+# -----------------------------------------------------------------------------
+
+class NatPmpService:
+    def __init__(self, config_file: str):
+        self.config = load_config(config_file)
+        self.gw = self.config.get("gateway", "10.2.0.1")
+
+        self.request_symmetrical = bool(self.config.get("request_symmetrical_port", False))
+        self.extra_ports = self.config.get("ports_to_forward", [])
+        
+        # qBittorrent
+        self.enable_qb = bool(self.config.get("enable_qbittorrent", False))
+        self.qb_conf = self.config.get("qbittorrent", {})
+        
+        # Hook
+        self.hook_script = self.config.get("hook_script", "")
+
+        # State tracking
+        self.last_sym_tcp = None
+        self.last_sym_udp = None
+        self.last_extra_ports = {}  # key: (private, protocol) -> public_port
+
+    def start(self):
+        """
+        Main infinite loop. Refresh NAT-PMP mappings every ~45 seconds.
+        """
+        # Clear existing mappings first
+        logging.info("Clearing NAT-PMP mappings (TCP+UDP) before start.")
+        clear_all_natpmp("tcp", self.gw)
+        clear_all_natpmp("udp", self.gw)
+        
+        # Trap signals for graceful stop
+        signal.signal(signal.SIGTERM, self.stop_handler)
+        signal.signal(signal.SIGINT, self.stop_handler)
+
+        while True:
+            changed = False
+
+            # 1) Symmetrical port
+            if self.request_symmetrical:
+                sym_tcp = call_natpmpc(1, 0, "tcp", TTL, self.gw)
+                sym_udp = call_natpmpc(1, 0, "udp", TTL, self.gw)
+                
+                if sym_tcp and sym_udp:
+                    logging.info("Symmetrical ports: TCP=%s, UDP=%s", sym_tcp, sym_udp)
+                    if (sym_tcp != self.last_sym_tcp) or (sym_udp != self.last_sym_udp):
+                        changed = True
+                        self.last_sym_tcp = sym_tcp
+                        self.last_sym_udp = sym_udp
+
+                    # If qBit is enabled, update if changed
+                    if self.enable_qb and sym_tcp:
+                        self.update_qbittorrent(sym_tcp)
+                else:
+                    logging.error("Failed to get symmetrical ports this round.")
+
+            # 2) Additional ports
+            new_ports = {}
+            for mapping in self.extra_ports:
+                private_port = mapping["private_port"]
+                protocol = mapping["protocol"]
+                pub_port = call_natpmpc(1, private_port, protocol, TTL, self.gw)
+                if pub_port:
+                    new_ports[(private_port, protocol)] = pub_port
+                    old_port = self.last_extra_ports.get((private_port, protocol))
+                    if old_port != pub_port:
+                        changed = True
+                else:
+                    logging.error("Failed to map private port %s (%s).", private_port, protocol)
+            
+            # Compare new vs old extra ports
+            if changed:
+                self.last_extra_ports = new_ports
+
+            # 3) If anything changed, run hook
+            if changed:
+                hook_args = []
+                if self.request_symmetrical and self.last_sym_tcp and self.last_sym_udp:
+                    hook_args.append(f"--symm-tcp={self.last_sym_tcp}")
+                    hook_args.append(f"--symm-udp={self.last_sym_udp}")
+                
+                for (pvt, proto), pub in self.last_extra_ports.items():
+                    hook_args.append(f"--map={pvt}:{proto}={pub}")
+                
+                run_hook_script(self.hook_script, hook_args)
+
+            # Sleep, then repeat
+            time.sleep(SLEEP_INTERVAL)
+
+    def update_qbittorrent(self, new_port: int):
+        """
+        If qBit is running, log in and update the port if necessary.
+        """
+        qb_url = self.qb_conf.get("url")
+        qb_user = self.qb_conf.get("username")
+        qb_pass = self.qb_conf.get("password")
+        
+        if not (qb_url and qb_user and qb_pass):
+            logging.warning("qBittorrent config incomplete. Skipping update.")
+            return
+        
+        cookie = qbittorrent_login(qb_url, qb_user, qb_pass)
+        if cookie:
+            current_port = qbittorrent_get_port(qb_url, cookie)
+            if current_port != new_port:
+                qbittorrent_set_port(qb_url, cookie, new_port)
+            else:
+                logging.info("qBittorrent already set to port %s", new_port)
+        else:
+            logging.error("Could not login to qBittorrent.")
+
+    def stop_handler(self, signum, frame):
+        """
+        Handle SIGTERM/SIGINT: Clear all mappings, then exit.
+        """
+        logging.info("Received signal %s. Clearing NAT-PMP ports and exiting.", signum)
+        clear_all_natpmp("tcp", self.gw)
+        clear_all_natpmp("udp", self.gw)
+        sys.exit(0)
+
+
+def usage():
+    print("Usage: protonwireguard_natpmp.py start|stop [--config=PATH]")
+    sys.exit(1)
+
+def main():
+    if len(sys.argv) < 2:
+        usage()
+    
+    command = sys.argv[1]
+    config_file = CONFIG_PATH
+    for arg in sys.argv[2:]:
+        if arg.startswith("--config="):
+            config_file = arg.split("=", 1)[1]
+
+    if command == "start":
+        service = NatPmpService(config_file)
+        service.start()
+    elif command == "stop":
+        # Typically, you'd rely on systemd's `ExecStop` sending SIGTERM.
+        # If you want a manual “stop” command, you could integrate a PID file.
+        print("Manual stop not implemented. Use systemd or kill the process.")
+    else:
+        usage()
+
+if __name__ == "__main__":
+    main()
