@@ -4,7 +4,7 @@
 TTL=60 # ProtonVPN-specific requirement
 
 # Load configuration
-CONFIG_FILE="/etc/protonvpn-port-forward.conf"
+CONFIG_FILE="/etc/protonvpn-wireguard-utils/protonvpn-port-forward.conf"
 if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "Error: Configuration file $CONFIG_FILE not found."
     exit 1
@@ -88,7 +88,9 @@ request_nat_pmp_port() {
 
 clear_nat_pmp_ports() {
     local protocol=$1
-    nat_pmp_action 0 0 "$protocol" 0
+    if [[ "$CLEAR_PORTS" == "true" ]]; then
+        nat_pmp_action 0 0 "$protocol" 0
+    fi
 }
 
 # Function to display usage
