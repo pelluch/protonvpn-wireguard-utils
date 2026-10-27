@@ -1,7 +1,7 @@
 # qBittorrent WebUI settings
 QB_URL="http://127.0.0.1:8080"
-QB_USER=""
-QB_PASSWORD=""
+# Requires qBittorrent 5.2+; generate it in the WebUI under Options → Web UI
+QB_API_KEY=""
 
 # The ProtonVPN Gateway
 # Obtained from https://protonvpn.com/support/port-forwarding-manual-setup#linux

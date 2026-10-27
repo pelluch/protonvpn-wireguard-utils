@@ -1,9 +1,7 @@
 #!/bin/bash
 
-# Constants
 TTL=60 # ProtonVPN-specific requirement
 
-# Load configuration
 CONFIG_FILE="/etc/protonvpn-wireguard-utils/protonvpn-port-forward.conf"
 if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "Error: Configuration file $CONFIG_FILE not found."
@@ -11,7 +9,6 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 fi
 source "$CONFIG_FILE"
 
-# Validate required parameters
 if [[ -z "$GATEWAY" ]]; then
     echo "Error: GATEWAY is not set in the configuration file."
     exit 1
@@ -22,14 +19,14 @@ if [[ -z "$REQUEST_SYMMETRICAL_PORT" ]]; then
     exit 1
 fi
 
-if [[ -z "$PORTS_TO_FORWARD" && "$REQUEST_SYMMETRICAL_PORT" != "true" ]]; then
+if [[ "${#PORTS_TO_FORWARD[@]}" -eq 0 && "$REQUEST_SYMMETRICAL_PORT" != "true" ]]; then
     echo "Error: PORTS_TO_FORWARD is empty and REQUEST_SYMMETRICAL_PORT is false. Nothing to do."
     exit 1
 fi
 
 if [[ "$REQUEST_SYMMETRICAL_PORT" == "true" && "$SET_QBITTORRENT_PORT" == "true" ]]; then
-    if [[ -z "$QB_URL" || -z "$QB_USER" || -z "$QB_PASSWORD" ]]; then
-        echo "Error: QB_URL, QB_USER, and QB_PASSWORD must be set in the configuration file if SET_QBITTORRENT_PORT is true."
+    if [[ -z "$QB_URL" || -z "$QB_API_KEY" ]]; then
+        echo "Error: QB_URL and QB_API_KEY must be set in the configuration file if SET_QBITTORRENT_PORT is true."
         exit 1
     fi
 fi
@@ -41,42 +38,47 @@ if [[ "${#PORTS_TO_FORWARD[@]}" -gt 5 ]]; then
 fi
 
 # Functions
-login_to_qbittorrent() {
-    curl -si -X POST -d "username=$QB_USER&password=$QB_PASSWORD" "$QB_URL/api/v2/auth/login" | grep -Fi "set-cookie" | awk '{print $2}' | tr -d ';'
+qbittorrent_api() {
+    local endpoint=$1
+    shift
+    # Header read from stdin keeps the API key out of the process list
+    curl -sS --fail --max-time 5 -H @- "$@" "$QB_URL/api/v2/$endpoint" <<< "Authorization: Bearer $QB_API_KEY"
 }
 
-get_current_qbittorrent_port() {
-    local COOKIE=$1
-    curl -s --cookie "$COOKIE" "$QB_URL/api/v2/app/preferences" | jq -r '.listen_port'
-}
-
-update_qbittorrent_port() {
-    local PORT=$1
-    local COOKIE=$2
-    curl -s -X POST --cookie "$COOKIE" --data-urlencode "json={\"listen_port\":$PORT}" "$QB_URL/api/v2/app/setPreferences"
+set_qbittorrent_port() {
+    local port=$1
+    local current_port
+    if ! current_port=$(qbittorrent_api app/preferences | jq -er '.listen_port'); then
+        echo "$(date): Failed to read qBittorrent listening port"
+    elif [[ "$current_port" == "$port" ]]; then
+        echo "$(date): qBittorrent port already set to $port"
+    elif qbittorrent_api app/setPreferences --data-urlencode "json={\"listen_port\":$port}"; then
+        echo "$(date): Updated qBittorrent listening port to $port"
+    else
+        echo "$(date): Failed to update qBittorrent listening port to $port"
+    fi
 }
 
 nat_pmp_action() {
-    local action=$1
+    local public_port=$1
     local private_port=$2
     local protocol=$3
     local ttl=$4
-    output=$(natpmpc -a "$action" "$private_port" "$protocol" "$ttl" -g "$GATEWAY" 2>&1)
+    local output mapped_port
 
-    if grep -q "readnatpmpresponseorretry() failed" <<< "$output"; then
-        echo "Error: NAT-PMP request failed."
+    if ! output=$(natpmpc -a "$public_port" "$private_port" "$protocol" "$ttl" -g "$GATEWAY" 2>&1); then
+        echo "Error: NAT-PMP request failed." >&2
         echo "$output" >&2
         return 1
     fi
 
-    public_port=$(grep -oP 'Mapped public port \K[0-9]+' <<< "$output")
-    if [[ -n "$public_port" ]]; then
-        echo "$public_port"
-        return 0
-    else
-        echo "Error: Failed to parse the mapped public port."
+    mapped_port=$(grep -oP 'Mapped public port \K[0-9]+' <<< "$output")
+    if [[ -z "$mapped_port" ]]; then
+        echo "Error: Failed to parse the mapped public port." >&2
+        echo "$output" >&2
         return 1
     fi
+    echo "$mapped_port"
 }
 
 request_nat_pmp_port() {
@@ -87,27 +89,25 @@ request_nat_pmp_port() {
 }
 
 clear_nat_pmp_ports() {
-    local protocol=$1
+    local protocol
     if [[ "$CLEAR_PORTS" == "true" ]]; then
-        nat_pmp_action 0 0 "$protocol" 0
+        for protocol in tcp udp; do
+            nat_pmp_action 0 0 "$protocol" 0 > /dev/null && echo "$(date): Cleared $protocol port mappings"
+        done
     fi
 }
 
-# Function to display usage
 usage() {
     echo "Usage: $0 {start|stop}"
     exit 1
 }
 
-# Check for required parameter
 if [ "$#" -ne 1 ]; then
     usage
 fi
 
-# Handle "start" and "stop" parameters
 case "$1" in
     start)
-        # Original behavior of the script goes here
         echo "Starting script..."
         ;;
     stop)
@@ -120,17 +120,7 @@ case "$1" in
         ;;
 esac
 
-
-# Check if there is nothing to do
-if [[ "$REQUEST_SYMMETRICAL_PORT" != "true" && "${#PORTS_TO_FORWARD[@]}" -eq 0 ]]; then
-    echo "Error: Nothing to do. Exiting."
-    exit 1
-fi
-
-
-# Clear NAT-PMP ports
-clear_nat_pmp_ports tcp > /dev/null
-clear_nat_pmp_ports udp > /dev/null
+clear_nat_pmp_ports
 
 # Main Loop
 while true; do
@@ -142,19 +132,7 @@ while true; do
         if [[ -n "$SYMM_TCP_PORT" && -n "$SYMM_UDP_PORT" ]]; then
             echo "$(date): Symmetrical ports forwarded: TCP=$SYMM_TCP_PORT, UDP=$SYMM_UDP_PORT"
             if [[ "$SET_QBITTORRENT_PORT" == "true" ]]; then
-                echo "Trying to log in to bittorrent"
-                COOKIE=$(login_to_qbittorrent)
-                if [ -n "$COOKIE" ]; then
-                    CURRENT_PORT=$(get_current_qbittorrent_port "$COOKIE")
-                    if [ "$CURRENT_PORT" != "$SYMM_TCP_PORT" ]; then
-                        update_qbittorrent_port "$SYMM_TCP_PORT" "$COOKIE"
-                        echo "$(date): Updated qBittorrent listening port to $SYMM_TCP_PORT"
-                    else
-                        echo "$(date): qBittorrent port already set to $SYMM_TCP_PORT"
-                    fi
-                else
-                    echo "$(date): Failed to log in to qBittorrent"
-                fi
+                set_qbittorrent_port "$SYMM_TCP_PORT"
             fi
         else
             echo "$(date): Error requesting symmetrical port."
