@@ -66,11 +66,12 @@ nat_pmp_action() {
     local ttl=$4
     local output mapped_port
 
-    if ! output=$(natpmpc -a "$public_port" "$private_port" "$protocol" "$ttl" -g "$GATEWAY" 2>&1); then
-        echo "Error: NAT-PMP request failed." >&2
-        echo "$output" >&2
-        return 1
-    fi
+    output=$(timeout 5 natpmpc -a "$public_port" "$private_port" "$protocol" "$ttl" -g "$GATEWAY" 2>&1)
+    case $? in
+        0) ;;
+        124) echo "Error: No NAT-PMP response from $GATEWAY. Is the VPN connected?" >&2; return 1 ;;
+        *) echo "Error: NAT-PMP request failed." >&2; echo "$output" >&2; return 1 ;;
+    esac
 
     mapped_port=$(grep -oP 'Mapped public port \K[0-9]+' <<< "$output")
     if [[ -z "$mapped_port" ]]; then
