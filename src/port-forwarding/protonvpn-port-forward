@@ -3,39 +3,55 @@
 # Based on https://protonvpn.com/support/port-forwarding-manual-setup#linux
 TTL=60
 
+# "<3>" sets the journald priority to error, see sd-daemon(3)
+error() {
+    echo "<3>$*" >&2
+}
+
 CONFIG_FILE="/etc/protonvpn-wireguard-utils/protonvpn-port-forward.conf"
 if [[ ! -f "$CONFIG_FILE" ]]; then
-    echo "Error: Configuration file $CONFIG_FILE not found."
+    error "Error: Configuration file $CONFIG_FILE not found."
     exit 1
 fi
 source "$CONFIG_FILE"
 
 if [[ -z "$GATEWAY" ]]; then
-    echo "Error: GATEWAY is not set in the configuration file."
+    error "Error: GATEWAY is not set in the configuration file."
     exit 1
 fi
 
 if [[ -z "$REQUEST_SYMMETRICAL_PORT" ]]; then
-    echo "Error: REQUEST_SYMMETRICAL_PORT is not set in the configuration file."
+    error "Error: REQUEST_SYMMETRICAL_PORT is not set in the configuration file."
     exit 1
 fi
 
 if [[ "${#PORTS_TO_FORWARD[@]}" -eq 0 && "$REQUEST_SYMMETRICAL_PORT" != "true" ]]; then
-    echo "Error: PORTS_TO_FORWARD is empty and REQUEST_SYMMETRICAL_PORT is false. Nothing to do."
+    error "Error: PORTS_TO_FORWARD is empty and REQUEST_SYMMETRICAL_PORT is false. Nothing to do."
     exit 1
 fi
 
 if [[ "$REQUEST_SYMMETRICAL_PORT" == "true" && "$SET_QBITTORRENT_PORT" == "true" ]]; then
     if [[ -z "$QB_URL" || -z "$QB_API_KEY" ]]; then
-        echo "Error: QB_URL and QB_API_KEY must be set in the configuration file if SET_QBITTORRENT_PORT is true."
+        error "Error: QB_URL and QB_API_KEY must be set in the configuration file if SET_QBITTORRENT_PORT is true."
         exit 1
     fi
 fi
 
 if [[ "${#PORTS_TO_FORWARD[@]}" -gt 5 ]]; then
-    echo "Error: More than 5 ports specified in PORTS_TO_FORWARD. Maximum allowed is 5."
+    error "Error: More than 5 ports specified in PORTS_TO_FORWARD. Maximum allowed is 5."
     exit 1
 fi
+
+declare -A LAST_LOGGED
+
+log_on_change() {
+    local key=$1
+    local message=$2
+    if [[ "${LAST_LOGGED[$key]}" != "$message" ]]; then
+        echo "$(date): $message"
+        LAST_LOGGED[$key]=$message
+    fi
+}
 
 qbittorrent_api() {
     local endpoint=$1
@@ -48,13 +64,13 @@ set_qbittorrent_port() {
     local port=$1
     local current_port
     if ! current_port=$(qbittorrent_api app/preferences | jq -er '.listen_port'); then
-        echo "$(date): Failed to read qBittorrent listening port"
-    elif [[ "$current_port" == "$port" ]]; then
-        echo "$(date): qBittorrent port already set to $port"
-    elif qbittorrent_api app/setPreferences --data-urlencode "json={\"listen_port\":$port}"; then
-        echo "$(date): Updated qBittorrent listening port to $port"
-    else
-        echo "$(date): Failed to update qBittorrent listening port to $port"
+        error "$(date): Failed to read qBittorrent listening port"
+    elif [[ "$current_port" != "$port" ]]; then
+        if qbittorrent_api app/setPreferences --data-urlencode "json={\"listen_port\":$port}"; then
+            echo "$(date): Updated qBittorrent listening port to $port"
+        else
+            error "$(date): Failed to update qBittorrent listening port to $port"
+        fi
     fi
 }
 
@@ -68,13 +84,13 @@ nat_pmp_action() {
     output=$(timeout 5 natpmpc -a "$public_port" "$private_port" "$protocol" "$ttl" -g "$GATEWAY" 2>&1)
     case $? in
         0) ;;
-        124) echo "Error: No NAT-PMP response from $GATEWAY. Is the VPN connected?" >&2; return 1 ;;
-        *) echo "Error: NAT-PMP request failed." >&2; echo "$output" >&2; return 1 ;;
+        124) error "Error: No NAT-PMP response from $GATEWAY. Is the VPN connected?"; return 1 ;;
+        *) error "Error: NAT-PMP request failed."; echo "$output" >&2; return 1 ;;
     esac
 
     mapped_port=$(grep -oP 'Mapped public port \K[0-9]+' <<< "$output")
     if [[ -z "$mapped_port" ]]; then
-        echo "Error: Failed to parse the mapped public port." >&2
+        error "Error: Failed to parse the mapped public port."
         echo "$output" >&2
         return 1
     fi
@@ -124,28 +140,28 @@ clear_nat_pmp_ports
 
 while true; do
     if [[ "$REQUEST_SYMMETRICAL_PORT" == "true" ]]; then
-        echo "$(date): Requesting symmetrical port..."
         SYMM_TCP_PORT=$(request_nat_pmp_port 0 tcp "$TTL")
         SYMM_UDP_PORT=$(request_nat_pmp_port 0 udp "$TTL")
 
         if [[ -n "$SYMM_TCP_PORT" && -n "$SYMM_UDP_PORT" ]]; then
-            echo "$(date): Symmetrical ports forwarded: TCP=$SYMM_TCP_PORT, UDP=$SYMM_UDP_PORT"
+            log_on_change symmetric "Symmetrical ports forwarded: TCP=$SYMM_TCP_PORT, UDP=$SYMM_UDP_PORT"
             if [[ "$SET_QBITTORRENT_PORT" == "true" ]]; then
                 set_qbittorrent_port "$SYMM_TCP_PORT"
             fi
         else
-            echo "$(date): Error requesting symmetrical port."
+            error "$(date): Error requesting symmetrical port."
+            LAST_LOGGED[symmetric]=  # log the port again once it recovers
         fi
     fi
 
     for port_config in "${PORTS_TO_FORWARD[@]}"; do
         IFS=':' read -r private_port protocol <<< "$port_config"
-        echo "$(date): Requesting forwarding for private port $private_port, protocol $protocol..."
         PUBLIC_PORT=$(request_nat_pmp_port "$private_port" "$protocol" "$TTL")
         if [[ -n "$PUBLIC_PORT" ]]; then
-            echo "$(date): Public port $PUBLIC_PORT successfully forwarded to internal port $private_port for protocol $protocol"
+            log_on_change "$port_config" "Public port $PUBLIC_PORT successfully forwarded to internal port $private_port for protocol $protocol"
         else
-            echo "$(date): Error forwarding port $private_port for protocol $protocol"
+            error "$(date): Error forwarding port $private_port for protocol $protocol"
+            LAST_LOGGED[$port_config]=
         fi
     done
 
